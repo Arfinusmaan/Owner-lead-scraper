@@ -7,6 +7,7 @@ import { getSubLocations } from "./cityService.js";
 import { getJob, updateJob, setPauseFlag } from "./store.js";
 import { scoreLead } from "./intentScorer.js";
 import { enrichOwner, whoisLookup, closeEnricherBrowser } from "./ownerEnricher.js";
+import { discoverOwner } from "./ownerDiscovery.js";
 
 // Normalize phone numbers — strip everything except digits and leading +
 function cleanPhone(phone) {
@@ -437,6 +438,7 @@ export async function scrapeGoogleMaps(niche, location, filterType, negativeKeyw
             owner_name: "",
             owner_cell: "",
             owner_cell_source: "",
+            owner_cell_confidence: "",
             owner_email: "",
             owner_email_source: "",
             intent: "LOW",
@@ -455,8 +457,14 @@ export async function scrapeGoogleMaps(niche, location, filterType, negativeKeyw
                  return;
               }
 
-              // Owner name from website text extraction
-              const ownerFromSite = data.owner || '';
+              // Owner name from website text extraction (fallback)
+              let ownerFromSite = data.owner || '';
+              
+              // Run OpenCorporates Owner Discovery!
+              const trueOwner = await discoverOwner(lead.business_name, lead.state, log, jobId);
+              if (trueOwner) {
+                 ownerFromSite = trueOwner; // Override with the highly accurate government name
+              }
 
               // Build partial enriched lead to pass into enrichOwner
               const partialLead = {
@@ -473,12 +481,13 @@ export async function scrapeGoogleMaps(niche, location, filterType, negativeKeyw
 
               const enriched = {
                 ...lead,
-                primary_email:      ownerData.owner_email        || data.primary || lead.primary_email,
-                owner_name:         ownerFromSite                || lead.owner_name,
-                owner_cell:         ownerData.owner_cell         || '',
-                owner_cell_source:  ownerData.owner_cell_source  || '',
-                owner_email:        ownerData.owner_email        || '',
-                owner_email_source: ownerData.owner_email_source || '',
+                primary_email:          ownerData.owner_email            || data.primary || lead.primary_email,
+                owner_name:             ownerFromSite                    || lead.owner_name,
+                owner_cell:             ownerData.owner_cell             || '',
+                owner_cell_source:      ownerData.owner_cell_source      || '',
+                owner_cell_confidence:  ownerData.owner_cell_confidence  || '',
+                owner_email:            ownerData.owner_email            || '',
+                owner_email_source:     ownerData.owner_email_source     || '',
               };
 
               const scoreResult = scoreLead(enriched);
@@ -614,7 +623,12 @@ export async function enrichCSVList(leads, jobId, workerCount = 3, negativeKeywo
            return;
         }
 
-        const ownerFromSite = data.owner || '';
+        let ownerFromSite = data.owner || '';
+        const trueOwner = await discoverOwner(lead.business_name, lead.state, log, jobId);
+        if (trueOwner) {
+           ownerFromSite = trueOwner;
+        }
+
         const partialLead  = { ...lead, owner_name: ownerFromSite, primary_email: data.primary || '' };
 
         const ownerData = await enrichOwner(partialLead, { log, jobId }).catch(() => ({}));

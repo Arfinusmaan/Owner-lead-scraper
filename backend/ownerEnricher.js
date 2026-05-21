@@ -79,9 +79,47 @@ export async function closeEnricherBrowser() {
   }
 }
 
-// ─── TruePeopleSearch ─────────────────────────────────────────────────────────
+// ─── Cross-Reference Scoring ─────────────────────────────────────────────────
+// Scores a TPS result card text against known business details.
+// The higher the score, the more confident we are this is the right person.
 
-async function truePeopleSearch(ownerName, city, state) {
+function scoreCard(cardText, address, website) {
+  let score = 0;
+  const text = cardText.toLowerCase();
+
+  // ── 1. Street Address Match (strongest signal) ──
+  // Extract just the street number + first word of street from the Maps address
+  // e.g. "1234 Main St, Austin TX" → check if "1234 main" appears in card text
+  if (address) {
+    const addrLower = address.toLowerCase().replace(/,.*$/, '').trim(); // drop city/state part
+    const streetParts = addrLower.split(/\s+/).slice(0, 3); // first 3 words of street
+    const matched = streetParts.filter(p => p.length > 2 && text.includes(p)).length;
+    if (matched >= 2) score += 50; // High confidence: both number & street name match
+    else if (matched >= 1) score += 20;
+  }
+
+  // ── 2. Email Domain Match (strong signal) ──
+  // e.g. website = "https://apexplumbing.com" → look for "@apexplumbing.com" in card
+  if (website) {
+    try {
+      const domain = website
+        .replace(/^https?:\/\//i, '')
+        .replace(/^www\./i, '')
+        .split('/')[0]
+        .toLowerCase()
+        .trim();
+      if (domain && domain.length > 4 && text.includes(domain)) {
+        score += 60; // Best possible signal: their email matches the company domain
+      }
+    } catch {}
+  }
+
+  return score;
+}
+
+// ─── TruePeopleSearch (Cross-Reference Engine) ────────────────────────────────
+
+async function truePeopleSearch(ownerName, city, state, address = '', website = '') {
   const parts = ownerName.trim().split(/\s+/);
   if (parts.length < 2) return null;
 
@@ -89,7 +127,6 @@ async function truePeopleSearch(ownerName, city, state) {
   const page = await ctx.newPage();
 
   try {
-    // Block images/fonts to speed up
     await page.route('**/*', (route) => {
       const t = route.request().resourceType();
       if (['image', 'media', 'font', 'stylesheet'].includes(t)) return route.abort();
@@ -106,27 +143,67 @@ async function truePeopleSearch(ownerName, city, state) {
     const title = await page.title().catch(() => '');
     if (title.toLowerCase().includes('denied') || title.toLowerCase().includes('cloudflare')) return null;
 
-    // First result card
-    const card = page.locator('.card-summary').first();
-    if (!await card.count()) return null;
+    // ── Pull ALL result cards, not just the first ──
+    const cards = page.locator('.card-summary');
+    const cardCount = await cards.count().catch(() => 0);
+    if (cardCount === 0) return null;
 
-    const cardText = await card.innerText().catch(() => '');
-    const phones   = extractPhonesFromText(cardText);
+    let bestScore  = -1;
+    let bestPhone  = '';
+    let firstPhone = ''; // fallback if no card scores high
 
-    // Also check tel: href links inside the card
-    const telHrefs = await card.locator('a[href^="tel:"]').evaluateAll(links =>
-      links.map(l => l.getAttribute('href') || '')
-    ).catch(() => []);
+    for (let i = 0; i < Math.min(cardCount, 8); i++) { // check up to 8 results
+      const card = cards.nth(i);
 
-    for (const href of telHrefs) {
-      const num = href.replace('tel:', '').trim();
-      if (!isTollFree(num)) {
-        const f = formatPhone(num);
-        if (f && !phones.includes(f)) phones.unshift(f);
+      // Get full text of this card
+      const cardText = await card.innerText().catch(() => '');
+
+      // Get phones from tel: links inside this card (most reliable source)
+      const telHrefs = await card.locator('a[href^="tel:"]').evaluateAll(links =>
+        links.map(l => l.getAttribute('href') || '')
+      ).catch(() => []);
+
+      const phones = [];
+      for (const href of telHrefs) {
+        const num = href.replace('tel:', '').trim();
+        if (!isTollFree(num)) {
+          const f = formatPhone(num);
+          if (f && !phones.includes(f)) phones.push(f);
+        }
       }
+
+      // Fallback: extract phones from card text
+      if (phones.length === 0) {
+        phones.push(...extractPhonesFromText(cardText));
+      }
+
+      if (phones.length === 0) continue; // no phone on this card, skip
+
+      // Save the very first phone as the fallback
+      if (firstPhone === '') firstPhone = phones[0];
+
+      // Score this card with the Cross-Reference Engine
+      const cardScore = scoreCard(cardText, address, website);
+
+      if (cardScore > bestScore) {
+        bestScore = cardScore;
+        bestPhone = phones[0];
+      }
+
+      // 60+ means we found an email domain match — that's 100% confidence. Stop searching.
+      if (bestScore >= 60) break;
     }
 
-    return phones.length ? { cell: phones[0], source: 'TruePeopleSearch' } : null;
+    // If we found a confident cross-reference match, use it.
+    // If no card scored above 0, fall back to first phone (original behavior).
+    const finalPhone = bestScore > 0 ? bestPhone : firstPhone;
+    if (!finalPhone) return null;
+
+    return {
+      cell:       finalPhone,
+      source:     'TruePeopleSearch',
+      confidence: bestScore >= 60 ? 'HIGH' : bestScore >= 20 ? 'MEDIUM' : 'LOW',
+    };
 
   } catch {
     return null;
@@ -162,8 +239,8 @@ async function fastPeopleSearch(ownerName, city, state) {
     const bodyText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
     if (bodyText.includes('No results') || bodyText.trim().length < 50) return null;
 
-    const phones = extractPhonesFromText(bodyText.slice(0, 3000)); // Only first 3000 chars = first result
-    return phones.length ? { cell: phones[0], source: 'FastPeopleSearch' } : null;
+    const phones = extractPhonesFromText(bodyText.slice(0, 3000));
+    return phones.length ? { cell: phones[0], source: 'FastPeopleSearch', confidence: 'LOW' } : null;
 
   } catch {
     return null;
@@ -214,27 +291,29 @@ export async function whoisLookup(website) {
 // ─── Main Export ──────────────────────────────────────────────────────────────
 
 /**
- * enrichOwner({ owner_name, city, state, phone, website, primary_email }, { log, jobId })
- * Returns: { owner_cell, owner_cell_source, owner_email, owner_email_source }
+ * enrichOwner({ owner_name, city, state, address, phone, website, primary_email }, { log, jobId })
+ * Returns: { owner_cell, owner_cell_source, owner_cell_confidence, owner_email, owner_email_source }
  */
 export async function enrichOwner(lead, options = {}) {
   const { log = () => {}, jobId } = options;
 
   const result = {
-    owner_cell:         '',
-    owner_cell_source:  '',
-    owner_email:        lead.primary_email || '',
-    owner_email_source: lead.primary_email ? 'Website' : '',
+    owner_cell:            '',
+    owner_cell_source:     '',
+    owner_cell_confidence: '',
+    owner_email:           lead.primary_email || '',
+    owner_email_source:    lead.primary_email ? 'Website' : '',
   };
 
-  const { owner_name, city, state, website } = lead;
+  const { owner_name, city, state, website, address } = lead;
 
-  // ── Cell Phone: TPS → FPS ──
+  // ── Cell Phone: TPS (with Cross-Reference) → FPS fallback ──
   if (owner_name && owner_name.trim().split(/\s+/).length >= 2) {
     await sleep(500 + Math.random() * 500);
     log(`🔍 Cell lookup: ${owner_name} | ${city}, ${state}`, jobId);
 
-    let hit = await truePeopleSearch(owner_name, city, state);
+    // Pass address + website so the Cross-Reference Engine can score the results
+    let hit = await truePeopleSearch(owner_name, city, state, address || '', website || '');
 
     if (!hit) {
       await sleep(400 + Math.random() * 300);
@@ -242,9 +321,18 @@ export async function enrichOwner(lead, options = {}) {
     }
 
     if (hit) {
-      result.owner_cell        = hit.cell;
-      result.owner_cell_source = hit.source;
-      log(`📞 Cell: ${hit.cell} via ${hit.source}`, jobId);
+      const confidence = hit.confidence || 'LOW';
+
+      if (confidence === 'LOW') {
+        // ❌ Can't confirm this is the right person — discard the number entirely
+        log(`🚫 Discarding LOW confidence cell for ${owner_name} — could be wrong person`, jobId);
+      } else {
+        // ✅ HIGH or MEDIUM — we cross-referenced address/email domain, save it
+        result.owner_cell            = hit.cell;
+        result.owner_cell_source     = hit.source;
+        result.owner_cell_confidence = confidence;
+        log(`📞 Cell: ${hit.cell} via ${hit.source} [Confidence: ${confidence}]`, jobId);
+      }
     } else {
       log(`⚠️ No cell found for ${owner_name}`, jobId);
     }
@@ -262,3 +350,4 @@ export async function enrichOwner(lead, options = {}) {
 
   return result;
 }
+

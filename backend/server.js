@@ -223,26 +223,27 @@ app.get('/csv/:id', (req, res) => {
     return res.status(400).json({ error: 'No data available' });
   }
 
-  const headers = `"Company Name","Business Phone","Website","Email","Owner Name","Owner Cell","Owner Cell Source","Owner Email","Owner Email Source","Rating","Reviews","Intent","Lead Score","City","State","Address","Niche"\n`;
+  const headers = `"Company Name","Business Phone","Website","Email","Owner Name","Owner Cell","Owner Cell Confidence","Owner Cell Source","Owner Email","Owner Email Source","Rating","Reviews","Intent","Lead Score","City","State","Address","Niche"\n`;
 
   const formatRow = (l) => [
-    l.business_name        || '',
-    l.phone                || '',
-    l.website              || '',
-    l.primary_email        || l.owner_email || '',
-    l.owner_name           || '',
-    l.owner_cell           || '',
-    l.owner_cell_source    || '',
-    l.owner_email          || '',
-    l.owner_email_source   || '',
-    l.rating               || '',
-    l.reviews              || '',
-    l.intent               || '',
-    l.score                || '',
-    l.city                 || '',
-    l.state                || '',
-    l.address              || '',
-    job.niche              || ''
+    l.business_name             || '',
+    l.phone                     || '',
+    l.website                   || '',
+    l.primary_email             || l.owner_email || '',
+    l.owner_name                || '',
+    l.owner_cell                || '',
+    l.owner_cell_confidence     || '',
+    l.owner_cell_source         || '',
+    l.owner_email               || '',
+    l.owner_email_source        || '',
+    l.rating                    || '',
+    l.reviews                   || '',
+    l.intent                    || '',
+    l.score                     || '',
+    l.city                      || '',
+    l.state                     || '',
+    l.address                   || '',
+    job.niche                   || ''
   ].map(f => `"${String(f).replace(/"/g, '""')}"`).join(',');
 
   // Sort: leads with owner_cell first, then owner_name, then rest
